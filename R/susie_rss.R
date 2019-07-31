@@ -7,8 +7,6 @@
 #' equally likely to be non-zero. The prior on the non-zero element is N(0,var=prior_variance).
 #' @param z a p vector of z scores.
 #' @param R a p by p symmetric and positive semidefinite correlation matrix.
-#' @param maf_thresh threshold for MAF
-#' @param maf Minor Allele Frequency
 #' @param L maximum number of non-zero effects
 #' @param lambda fudge factor
 #' @param prior_variance the prior variance (vector of length L, or scalar. In latter case gets repeated L times )
@@ -30,12 +28,7 @@
 #' @param tol convergence tolerance based on alpha
 #' @param verbose if true outputs some progress messages
 #' @param track_fit add an attribute \code{trace} to output that saves current values of all iterations
-#' @param check_input whether to skip the checks for R and z, the checks are:
-#'
-#' 1. Check whether R is positive semidefinite
-#'
-#' 2. Check whether z in space spanned by the non-zero eigenvectors of R
-#'
+#' @param skip_checks whether to skip the checks for R and z
 #' @return a susie fit, which is a list with some or all of the following elements\cr
 #' \item{alpha}{an L by p matrix of posterior inclusion probabilites}
 #' \item{mu}{an L by p matrix of posterior means (conditional on inclusion)}
@@ -45,8 +38,7 @@
 #' \item{V}{prior variance}
 #'
 #' @export
-susie_rss = function(z, R, maf_thresh=0, maf=NULL,
-                     L=10, lambda = 0,
+susie_rss = function(z, R, L=10, lambda = 0,
                      prior_variance=50,residual_variance=NULL,
                      r_tol = 1e-08,
                      prior_weights = NULL, null_weight = NULL,
@@ -56,40 +48,29 @@ susie_rss = function(z, R, maf_thresh=0, maf=NULL,
                      estimate_prior_method = c("optim","EM"),
                      max_iter=100,s_init = NULL, intercept_value=0,
                      coverage=0.95, min_abs_corr=0.5,
-                     tol=1e-3, verbose=FALSE, track_fit = FALSE, check_input = FALSE){
-
-  warning('This method is under active development, so it should not be considered stable.')
+                     tol=1e-3, verbose=FALSE, track_fit = FALSE, skip_checks = FALSE){
 
   if(L > 1){
     warning('The maximum number of non-zero effects is greater than 1, this feature is experimental.')
   }
   estimate_prior_method <- match.arg(estimate_prior_method)
 
-  # MAF filter
-  if(!is.null(maf)){
-    if(length(maf) != length(z)){
-      stop(paste0('The length of maf does not agree with expected ', length(z)))
-    }
-    id = which(maf > maf_thresh)
-    R = R[id, id]
-    z = z[id]
-  }
-
   # replace NA in z with 0
   if (any(is.na(z))){
     warning('z scores contain NA, it is replaced with 0.')
     z[is.na(z)] = 0
   }
-  if(any(is.infinite(z))){
-    stop('z contains infinite value.')
-  }
-  # Check NA in R
+  # replace NA in R with 0
   if(any(is.na(R))){
-    stop('R matrix contains NA.')
+    warning('R matrix contains NA, it is replaced with 0.')
+    isnaR = is.na(R)
+    naind = which(rowSums(isnaR) == ncol(R)-1)
+    R[,naind] = 0
+    R[naind,] = 0
+    R[isnaR] = 0
   }
   if (!(is.double(R) & is.matrix(R)) & !inherits(R,"CsparseMatrix"))
-    stop("Input R must be a double-precision matrix, or a sparse matrix.")
-
+    stop("Input X must be a double-precision matrix, or a sparse matrix.")
   if (is.numeric(null_weight) && null_weight == 0) null_weight = NULL
   if (!is.null(null_weight)) {
     if (!is.numeric(null_weight))
@@ -107,30 +88,25 @@ susie_rss = function(z, R, maf_thresh=0, maf=NULL,
   p = ncol(R)
 
   # Check input R.
-  if(nrow(R) != length(z)) {
-    stop(paste0('The dimension of R (', nrow(R), ' by ', ncol(R), ') does not agree with expected (', length(z), ' by ', length(z), ')'))
-  }
-  if(!is_symmetric_matrix(R)){
-    stop('R is not a symmetric matrix.')
-  }
   ## eigen decomposition
-  semi_pd = check_semi_pd(R, r_tol)
-  R = semi_pd$matrix
+  R = set_R_attributes(R, length(z))
+
+  attr(R, "d") <- diag(R)
+  attr(R, "scaled:scale") <- rep(1, length = p)
 
   ## check whether z in space spanned by the non-zero eigenvectors of R
-  if(check_input){
-    # Check whether R is positive semidefinite
-    if(semi_pd$status == FALSE){
-      stop('R is not a positive semidefinite matrix.')
+  if(!skip_checks){
+    A = attr(R, 'eigenR')$vectors[,attr(R, 'eigenR')$values!=0]
+    in_space = all.equal(as.vector(A%*%solve(crossprod(A)) %*% crossprod(A, z)), z)
+    if(in_space!=TRUE){
+      warning('z score does not lie in the space of non-zero eigenvectors of R')
     }
-    # Check whether z in space spanned by the non-zero eigenvectors of R
-    proj = check_projection(R, z)
-    if(proj$status == FALSE)
-      warning('z does not lie in the space of non-zero eigenvectors of R')
   }
-  attr(R, 'eigen')$values = semi_pd$eigenvalues
-  attr(R, 'd') <- diag(R)
-  attr(R, 'scaled:scale') <- rep(1, length = p)
+  ## R psd
+  attr(R, 'eigenR')$values[abs(attr(R, 'eigenR')$values) < r_tol] <- 0
+  if(any(attr(R, 'eigenR')$values < 0)){
+    stop('R is not a positive semidefinite matrix.')
+  }
 
   # initialize susie fit
   s = init_setup_rss(p,L,prior_variance,residual_variance,prior_weights,null_weight,1)
@@ -163,10 +139,20 @@ susie_rss = function(z, R, maf_thresh=0, maf=NULL,
     }
     if(estimate_residual_variance){
 
+      # if(restrict){
+      #   est_sigma2 = optim(par=0.5, fn=estimate_sigma,
+      #                      R=R, z=z, s = s,
+      #                      method='Brent', lower = 0.01, upper = 1)$par
+      # }else{
+      #   est_sigma2 = optim(par=0.5, fn=estimate_sigma,
+      #                      R=R, z=z, s = s,
+      #                      method='Brent', lower = 0.01, upper = 300)$par
+      # }
+
       if(lambda == 0){
         tmp = s
         tmp$sigma2 = 1
-        est_sigma2 = (1/sum(attr(R, 'eigen')$values!=0))* get_ER2_rss(R,z,tmp)
+        est_sigma2 = (1/sum(attr(R, 'eigenR')$values!=0))* get_ER2_rss(R,z,tmp)
         if(est_sigma2 < 0){
           stop('Estimating residual variance failed: the estimated value is negative')
         }
@@ -234,22 +220,23 @@ susie_rss = function(z, R, maf_thresh=0, maf=NULL,
 
 update_Sigma = function(R, sigma2, z){
   Sigma = sigma2*R + attr(R, 'lambda') *diag(length(z))
-  eigenS = attr(R, 'eigen')
+  eigenS = attr(R, 'eigenR')
   eigenS$values = sigma2*eigenS$values + attr(R, 'lambda')
 
   Dinv = 1/(eigenS$values)
   Dinv[is.infinite(Dinv)] = 0
   attr(Sigma, 'eigenS') = eigenS
-
-  # Sigma^(-1) R_j
-  attr(Sigma, 'SinvRj') = eigenS$vectors %*% (Dinv*attr(R, 'eigen')$values * t(eigenS$vectors))
-
-  if(attr(R, 'lambda')==0){
-    attr(Sigma, 'RjSinvRj') = attr(R, 'd')/sigma2
-  }else{
-    attr(Sigma, 'RjSinvRj') = diag(eigenS$vectors %*% (Dinv*(attr(R, 'eigen')$values^2) * t(eigenS$vectors)))
-  }
-
+  attr(Sigma, 'SinvRj') = lapply(1:length(z), function(j){
+    eigenS$vectors %*% (Dinv * crossprod(eigenS$vectors, R[,j]))
+  })
+  attr(Sigma, 'RjSinvRj') = sapply(1:length(z), function(j){
+    sum(R[,j] * attr(Sigma, 'SinvRj')[[j]])
+  })
+  attr(Sigma, 'zSinvz') = sum(z * (eigenS$vectors %*% (Dinv * crossprod(eigenS$vectors, z))))
   return(Sigma)
 }
 
+# estimate_sigma = function(sigma2, R, z, s){
+#   s$sigma2 = sigma2
+#   -Eloglik_rss(R, z, s)
+# }

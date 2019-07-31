@@ -44,7 +44,7 @@ n_in_CS = function(res, coverage = 0.9){
 # subsample and compute min, mean, median and max abs corr
 #
 #' @importFrom stats median
-get_purity = function(pos, X, Xcorr, squared = FALSE, n = 100) {
+get_purity = function(pos, X, Xcorr, n = 100) {
   if (length(pos) == 1) {
     c(1,1,1)
   } else {
@@ -62,7 +62,6 @@ get_purity = function(pos, X, Xcorr, squared = FALSE, n = 100) {
     } else {
       value = abs(Xcorr[pos, pos])
     }
-    if (squared) value = value ^ 2
     c(min(value,na.rm=T), mean(value,na.rm=T), median(value,na.rm=T))
   }
 }
@@ -113,7 +112,6 @@ is_symmetric_matrix = function(x) {
 #' @param min_abs_corr a "purity" threshold for the CS. Any CS that contains
 #' a pair of variables with correlation less than this threshold will be filtered out and not reported.
 #' @param dedup If TRUE, "deduplicate" - that is remove duplicated CSs.
-#' @param squared If TRUE, report min, mean and median of squared correlation instead of absolute correlation.
 #' @return a list with elements:
 #'
 #' \item{cs}{a list, each element corresponds to a CS, and is a vector containing the indices of the variables in the CS.}
@@ -126,7 +124,7 @@ susie_get_cs = function(res,
                         X = NULL, Xcorr = NULL,
                         coverage = 0.95,
                         min_abs_corr = 0.5,
-                        dedup = TRUE, squared = FALSE) {
+                        dedup = TRUE) {
   if (class(res) == "susie") {
     null_index = res$null_index
     if (is.numeric(res$V)) include_idx = which(res$V != 0)
@@ -158,12 +156,10 @@ susie_get_cs = function(res,
     purity = data.frame(do.call(rbind, lapply(1:length(cs), function(i)
             {
                 if (null_index > 0 && null_index %in% cs[[i]]) c(-9,-9,-9)
-                else get_purity(cs[[i]], X, Xcorr, squared)
+                else get_purity(cs[[i]], X, Xcorr)
             })))
-    if (squared) colnames(purity) = c('min.sq.corr', 'mean.sq.corr', 'median.sq.corr')
-    else colnames(purity) = c('min.abs.corr', 'mean.abs.corr', 'median.abs.corr')
-    threshold = ifelse(squared, min_abs_corr^2, min_abs_corr)
-    is_pure = which(purity[,1] >= threshold)
+    colnames(purity) = c('min.abs.corr', 'mean.abs.corr', 'median.abs.corr')
+    is_pure = which(purity$min.abs.corr >= min_abs_corr)
     if (length(is_pure) > 0) {
       cs = cs[is_pure]
       purity = purity[is_pure,]
@@ -171,7 +167,7 @@ susie_get_cs = function(res,
       names(cs) = row_names
       rownames(purity) = row_names
       ## re-order CS list and purity rows based on purity
-      ordering = order(purity[,1], decreasing=T)
+      ordering = order(purity$min.abs.corr, decreasing=T)
       return(list(cs = cs[ordering], purity = purity[ordering,], cs_index = is_pure[ordering],coverage=coverage))
     } else {
       return(list(cs = NULL,coverage=coverage))
@@ -311,7 +307,7 @@ susie_plot = function(model,y,add_bar=FALSE,pos=NULL,b=NULL,max_cs=400,add_legen
   if(is.null(b)){b = rep(0,length(p))}
   if(is.null(pos)){pos = 1:length(p)}
   legend_text = list(col = vector(), purity = vector(), size = vector())
-  plot(pos,p,ylab=ylab, pch=16, ...)
+  plot(pos,p,col="black", ylab=ylab, pch=16, ...)
   if (is_susie && !is.null(model$sets$cs)) {
     for(i in rev(1:nrow(model$alpha))){
       if (!is.null(model$sets$cs_index) && !(i %in% model$sets$cs_index)) {
@@ -453,14 +449,12 @@ susie_slim = function(res){
 
 #' @title Get posterior mean for coefficients from fitted SuSiE model
 #' @param res a susie fit
-#' @export
 susie_get_posterior_mean = function(res){
-  colSums(res$alpha*res$mu)/res$X_column_scale_factors
+  colSums(res$alpha*s$mu)/res$X_column_scale_factors
 }
 
 #' @title Get posterior standard deviation for coefficients from fitted SuSiE model
 #' @param res a susie fit
-#' @export
 susie_get_posterior_sd = function(res){
   sqrt(colSums(res$alpha * res$mu2 - (res$alpha*res$mu)^2))/(res$X_column_scale_factors)
 }

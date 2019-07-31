@@ -12,8 +12,6 @@
 #'   The model is fitted using the "Iterative Bayesian Stepwise
 #'   Selection" (IBSS) algorithm.
 #'
-#'   See also \code{susie_trendfilter} for applying susie to non-parametric regression, particularly changepoint problems
-#'
 #' @param X An n by p matrix of covariates.
 #'
 #' @param Y A vector of length n.
@@ -166,16 +164,17 @@
 #' @export
 #'
 susie <- function(X,Y,L = min(10,ncol(X)),scaled_prior_variance = 0.2,
-                 residual_variance=NULL,
-                 prior_weights=NULL, null_weight=NULL,
-                 standardize=TRUE,intercept=TRUE,
-                 estimate_residual_variance=TRUE,
-                 estimate_prior_variance = TRUE,
-                 estimate_prior_method = c("optim","EM"),
-                 s_init = NULL,coverage=0.95,min_abs_corr=0.5,
-                 compute_univariate_zscore = FALSE,
-                 max_iter=100,tol=1e-3,
-                 verbose=FALSE,track_fit=FALSE) {
+                  residual_variance=NULL,
+                  prior_weights=NULL, null_weight=NULL,
+                  standardize=TRUE,intercept=TRUE,
+                  estimate_residual_variance=TRUE,
+                  estimate_prior_variance = TRUE,
+                  estimate_prior_method = c("optim","EM"),
+                  s_init = NULL,coverage=0.95,min_abs_corr=0.5,
+                  compute_univariate_zscore = FALSE,
+                  max_iter=100,tol=1e-3,
+                  verbose=FALSE,track_fit=FALSE,mixture=FALSE,
+                  mixture.method = "optim", track.estimate = FALSE) {
 
   # Process input estimate_prior_method.
   estimate_prior_method <- match.arg(estimate_prior_method)
@@ -184,7 +183,7 @@ susie <- function(X,Y,L = min(10,ncol(X)),scaled_prior_variance = 0.2,
   if (!(is.double(X) & is.matrix(X)) & !inherits(X,"CsparseMatrix") & is.null(attr(X,"matrix.type")))
     stop("Input X must be a double-precision matrix, or a sparse matrix, or a trend filtering matrix.")
   if (is.numeric(null_weight) && null_weight == 0) null_weight = NULL
-  if (!is.null(null_weight) && is.null(attr(X, "matrix.type"))) {
+  if (!is.null(null_weight)) {
     if (!is.numeric(null_weight))
       stop("Null weight must be numeric")
     if (null_weight<0 || null_weight>=1)
@@ -201,7 +200,7 @@ susie <- function(X,Y,L = min(10,ncol(X)),scaled_prior_variance = 0.2,
 
   # center and scale input.
   if(intercept){
-    Y = Y-mean_y
+      Y = Y - mean_y
   }
   X = set_X_attributes(X,center=intercept, scale=standardize)
   # initialize susie fit
@@ -213,6 +212,9 @@ susie <- function(X,Y,L = min(10,ncol(X)),scaled_prior_variance = 0.2,
     s = init_finalize(s)
   }
 
+  s$sigma2 <- 1
+  ridge.bar <- rep(0, p)
+
   #initialize elbo to NA
   elbo = rep(NA,max_iter+1)
   elbo[1] = -Inf;
@@ -223,22 +225,66 @@ susie <- function(X,Y,L = min(10,ncol(X)),scaled_prior_variance = 0.2,
     #s = add_null_effect(s,0)
     if (track_fit)
       tracking[[i]] = susie_slim(s)
-    s = update_each_effect(X, Y, s, estimate_prior_variance,estimate_prior_method)
+
+    s <- update_each_effect(X, Y, s, estimate_prior_variance, estimate_prior_method)
     if(verbose){
-        print(paste0("objective:",get_objective(X,Y,s)))
+        obj <- get_objective(X, Y, s)
+        if (mixture && i > 1) {
+            obj <- obj + llh + n / 2 * log (2 * pi * s$sigma2) + sum(ridge.res ^ 2) / (2 * s$sigma2)
+        }
+
+        print(paste0("objective (after susie update):", obj))
     }
-    if(estimate_residual_variance){
-      s$sigma2 = estimate_residual_variance(X,Y,s)
-      if(verbose){
-        print(paste0("objective:",get_objective(X,Y,s)))
+    if (mixture) {
+      Y <- Y + X %*% ridge.bar
+      r <- Y - s$Xr
+      # find the optimal prior variance by MLE
+      sigma.b2  <- MLE(X, r, s$sigma2, method = mixture.method)
+
+      ridge.fit <- ridge(X, r, sigma.b2, s$sigma2)
+      ridge.bar <- ridge.fit$beta.hat
+      ridge.var <- diag(X %*% ridge.fit$var %*% t(X))
+
+      Y <- Y - X %*% ridge.bar
+      ridge.res <- r - X %*% ridge.bar
+    }
+
+    if(verbose){
+      obj <- get_objective(X, Y, s)
+      if (mixture) {
+        # compute log-likelihood
+        llh <- compute.llh(sigma.b2, X, r, s$sigma2)
+        obj <- obj + llh + n / 2 * log (2 * pi * s$sigma2) + sum(ridge.res ^ 2) / (2 * s$sigma2)
       }
+
+      print(paste0("objective (after ridge update):", obj))
+    }
+
+    if(estimate_residual_variance){
+        s$sigma2 = estimate_residual_variance(X, Y, s)
+        if (mixture) {
+            if(track.estimate) {
+              print(paste0("estimated sigma2:", s$sigma2))
+              print(paste0("average ridge.var:", mean(ridge.var)))
+            }
+            s$sigma2 <- s$sigma2 + mean(ridge.var)
+        }
+        if(verbose){
+            obj <- get_objective(X, Y, s)
+            if (mixture) {
+                # compute log-likelihood
+                llh <- compute.llh(sigma.b2, X, r, s$sigma2)
+                obj <- obj + llh + n / 2 * log (2 * pi * s$sigma2) + sum(ridge.res ^ 2) / (2 * s$sigma2)
+            }
+            print(paste0("objective (after update sigma2):", obj))
+        }
     }
     #s = remove_null_effects(s)
 
     elbo[i+1] = get_objective(X,Y,s)
     if((elbo[i+1]-elbo[i])<tol) {
-      s$converged = TRUE
-      break;
+        s$converged = TRUE
+        break;
     }
   }
   elbo = elbo[2:(i+1)] # Remove first (infinite) entry, and trailing NAs.
@@ -276,5 +322,13 @@ susie <- function(X,Y,L = min(10,ncol(X)),scaled_prior_variance = 0.2,
   }
   ## for prediction
   s$X_column_scale_factors = attr(X,"scaled:scale")
+
+  ## mixture
+
+  if (mixture) {
+    s$sigma.b2   <- sigma.b2
+    s$ridge.coef <- ridge.fit$beta.hat
+  }
+
   return(s)
 }
